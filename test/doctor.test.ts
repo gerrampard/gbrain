@@ -21,9 +21,19 @@ describe('doctor command', () => {
     expect(stdout).toContain('--fast');
   });
 
+  test('frontmatter_integrity subcheck added in v0.22.4', async () => {
+    const fs = await import('fs');
+    const src = fs.readFileSync('src/commands/doctor.ts', 'utf8');
+    // Subcheck name and call into shared scanner are present.
+    expect(src).toContain("name: 'frontmatter_integrity'");
+    expect(src).toContain('scanBrainSources');
+    // Fix hint points at the right CLI command.
+    expect(src).toContain('gbrain frontmatter validate');
+  });
+
   test('Check interface supports issues array', async () => {
-    const { Check } = await import('../src/commands/doctor.ts');
-    // The Check type allows an optional issues array for resolver findings
+    // `Check` is a TypeScript interface — type-only, no runtime value.
+    // Importing it for type assertion is enough to validate the shape.
     const check: import('../src/commands/doctor.ts').Check = {
       name: 'resolver_health',
       status: 'warn',
@@ -89,5 +99,79 @@ describe('doctor command', () => {
     expect(source).toMatch(/table:\s*'raw_data'.*col:\s*'data'/);
     expect(source).toMatch(/table:\s*'ingest_log'.*col:\s*'pages_updated'/);
     expect(source).toMatch(/table:\s*'files'.*col:\s*'metadata'/);
+  });
+
+  // v0.18 RLS hardening — regression guards for PR #336 + schema backfill.
+  // These are structural assertions on the source string so a silent revert
+  // of the severity or the IN-filter removal fails loudly without a live DB.
+  test('RLS check scans ALL public tables (no hardcoded tablename IN list near the RLS block)', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const rlsBlock = source.slice(
+      source.indexOf('// 5. RLS'),
+      source.indexOf('// 6. Schema version'),
+    );
+    expect(rlsBlock.length).toBeGreaterThan(0);
+    // Old pattern — must not come back. If it does, we're filtering the scan
+    // to a hardcoded set and every plugin/user table is invisible again.
+    expect(rlsBlock).not.toMatch(/tablename\s+IN\s*\(/);
+    // New semantics: the scan query has no WHERE-IN filter, just schemaname='public'.
+    expect(rlsBlock).toMatch(/FROM\s+pg_tables\b[\s\S]{0,200}schemaname\s*=\s*'public'/);
+  });
+
+  test('RLS check raises status=fail with quoted-identifier remediation SQL', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const rlsBlock = source.slice(
+      source.indexOf('// 5. RLS'),
+      source.indexOf('// 6. Schema version'),
+    );
+    // Severity upgraded from 'warn' to 'fail' so `gbrain doctor` exits 1 on gaps.
+    expect(rlsBlock).toMatch(/status:\s*'fail'/);
+    // Remediation SQL uses quoted identifiers — safe for names with hyphens,
+    // reserved words, mixed case.
+    expect(rlsBlock).toContain('ALTER TABLE "public"."');
+    expect(rlsBlock).toContain('ENABLE ROW LEVEL SECURITY');
+  });
+
+  test('RLS check skips on PGLite (no PostgREST, not applicable)', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const rlsBlock = source.slice(
+      source.indexOf('// 5. RLS'),
+      source.indexOf('// 6. Schema version'),
+    );
+    expect(rlsBlock).toMatch(/engine\.kind\s*===\s*'pglite'/);
+    expect(rlsBlock).toContain('PGLite');
+  });
+
+  test('RLS check reads pg_description and recognizes the GBRAIN:RLS_EXEMPT escape hatch', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const rlsBlock = source.slice(
+      source.indexOf('// 5. RLS'),
+      source.indexOf('// 6. Schema version'),
+    );
+    expect(rlsBlock).toContain('obj_description');
+    expect(rlsBlock).toContain('GBRAIN:RLS_EXEMPT');
+    // The regex must require a non-empty reason= segment. "Blood" is in the
+    // requirement to write a real justification, not just the prefix.
+    expect(rlsBlock).toMatch(/reason=/);
+  });
+
+  // v0.26.7 — rls_event_trigger check (post-install drift detector for v35).
+  // Lives AFTER `// 6. Schema version` so the existing `// 5. RLS` slice
+  // tests stay intact (codex correction).
+  test('rls_event_trigger check exists, scoped after schema_version, healthy on (O,A) only', async () => {
+    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
+    const idx7 = source.indexOf('// 7. RLS event trigger');
+    const idx8 = source.indexOf('// 8. Embedding health');
+    expect(idx7).toBeGreaterThan(0);
+    expect(idx8).toBeGreaterThan(idx7);
+    const block = source.slice(idx7, idx8);
+    expect(block).toContain("name: 'rls_event_trigger'");
+    // Healthy set is origin (`O`) or always (`A`). `R` is replica-only and
+    // would not fire in normal sessions; `D` is disabled. Both are warn states.
+    expect(block).toMatch(/evtenabled\s*!==\s*'O'[\s\S]*?evtenabled\s*!==\s*'A'/);
+    // PGLite skip path is required (no event triggers there).
+    expect(block).toMatch(/engine\.kind\s*===\s*'pglite'/);
+    // Recovery command names the migration version explicitly.
+    expect(block).toContain('--force-retry 35');
   });
 });
